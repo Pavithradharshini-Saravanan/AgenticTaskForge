@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+.env/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Screenshots (optional - remove this line if you want to track them)
+# screenshot_test.png
