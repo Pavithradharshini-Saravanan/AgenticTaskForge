@@ -58,12 +58,15 @@ if hasattr(sys.stdout, "reconfigure"):
 # ────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ────────────────────────────────────────────────────────────────────────────
-OLLAMA_URL    = "http://localhost:11434/api/generate"
-MODEL_NAME    = "phi3:mini"
-MAX_STEPS     = 15          # hard stop to prevent infinite loops
-STEP_DELAY    = 0.5         # seconds between steps
-LLM_TIMEOUT   = 180         # seconds — phi3:mini cold-load takes up to 2 min
-LLM_RETRIES   = 2           # retry on timeout before giving up
+OLLAMA_URL      = "http://localhost:11434/api/generate"
+OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+ROUTER_MODEL    = "qwen2.5:3b"
+MODEL_NAME      = "phi3:mini"
+MAX_STEPS       = 15          # hard stop to prevent infinite loops
+STEP_DELAY      = 0.5         # seconds between steps
+LLM_TIMEOUT     = 180         # seconds — phi3:mini cold-load takes up to 2 min
+LLM_RETRIES     = 2           # retry on timeout before giving up
 
 # ────────────────────────────────────────────────────────────────────────────
 # Helpers (reused from module5_orchestrator)
@@ -151,22 +154,49 @@ def ask_llm(prompt: str, temperature: float = 0.15, max_tokens: int = 128) -> st
     raise RuntimeError(f"LLM unreachable after {LLM_RETRIES + 1} attempts: {last_err}")
 
 
-def warm_up_llm():
+def check_and_preload_ollama() -> bool:
     """
-    Sends a tiny prompt to Ollama at startup so phi3:mini is loaded into
-    GPU/CPU memory before the first real user request. Prevents cold-start timeout.
+    On launch, verifies Ollama server is reachable at http://localhost:11434/api/tags.
+    Shows a clear error if it isn't. Preloads qwen2.5:3b once with keep_alive: -1.
     """
+    print(f"  [Startup] Checking Ollama server at {OLLAMA_TAGS_URL}...")
     try:
-        print("  [LLM] Warming up phi3:mini model...")
-        requests.post(
-            OLLAMA_URL,
-            json={"model": MODEL_NAME, "prompt": "hi", "stream": False,
-                  "options": {"temperature": 0.1, "num_predict": 1}},
-            timeout=LLM_TIMEOUT,
-        )
-        print("  [LLM] Model ready.")
-    except Exception as e:
-        print(f"  [LLM] Warm-up failed (will retry on first use): {e}")
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=5)
+        if resp.status_code != 200:
+            print(f"\n  [ERROR] Ollama server returned HTTP status {resp.status_code} at {OLLAMA_TAGS_URL}.")
+            print("  Please make sure Ollama server is running ('ollama serve').\n")
+            return False
+    except Exception as exc:
+        print(f"\n  [ERROR] Ollama server is NOT reachable at {OLLAMA_TAGS_URL}: {exc}")
+        print("  Please make sure Ollama server is running ('ollama serve').\n")
+        return False
+
+    print(f"  [Startup] Preloading router model '{ROUTER_MODEL}' (keep_alive: -1)...")
+    t0 = time.perf_counter()
+    try:
+        payload = {
+            "model": ROUTER_MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "keep_alive": -1,
+            "options": {"num_predict": 1}
+        }
+        resp2 = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=60)
+        t_preload = time.perf_counter() - t0
+        if resp2.status_code == 200:
+            print(f"  [Startup] Model '{ROUTER_MODEL}' preloaded and ready ({t_preload:.2f}s).")
+            return True
+        else:
+            print(f"  [WARNING] Preloading '{ROUTER_MODEL}' returned HTTP {resp2.status_code}: {resp2.text[:150]}")
+            return False
+    except Exception as exc:
+        print(f"  [WARNING] Could not preload model '{ROUTER_MODEL}': {exc}")
+        return False
+
+
+def warm_up_llm():
+    """Warms up Ollama router model on launch."""
+    check_and_preload_ollama()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -646,7 +676,7 @@ TOOL_REGISTRY = {
             "url='https://www.youtube.com/results?search_query=...' or url='https://www.google.com/search?q=...'."
         ),
         "params": {
-            "url": "Full target web URL or search URL (e.g. 'https://www.youtube.com/results?search_query=python')"
+            "url": "Full target web URL or search URL (e.g. 'https://www.google.com/search?q=...')"
         },
         "executor": lambda p: action_open_browser(p["url"]),
     },
@@ -995,13 +1025,201 @@ def check_completion(goal: str, last: dict) -> Optional[str]:
     return None
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# SINGLE-PASS ROUTER LAYER (qwen2.5:3b)
+# ════════════════════════════════════════════════════════════════════════════
+
+ROUTER_SYSTEM_PROMPT = (
+    "You are an AI assistant that routes user commands to a single tool call.\n"
+    "Tools: open_app(app_name) [for native desktop apps like whatsapp, spotify, notepad], open_url(url), web_search_play(query), type_text(text), click(text)\n"
+    'Example: User: "send hi to contact on whatsapp" -> {"tool": "open_app", "args": {"app_name": "whatsapp"}}\n'
+    'Respond ONLY with valid JSON: {"tool": "<tool_name>", "args": {<arguments>}}'
+)
+
+
+def _router_exec_open_app(args: dict) -> tuple[str, float]:
+    app_name = args.get("app_name") or args.get("name") or args.get("app") or ""
+    if not app_name:
+        raise ValueError("Missing 'app_name' argument")
+    return _ctrl_focus_app(str(app_name)), 0.0
+
+
+def _router_exec_open_url(args: dict) -> tuple[str, float]:
+    url = args.get("url") or args.get("query") or ""
+    if not url:
+        raise ValueError("Missing 'url' argument")
+    if "whatsapp" in str(url).lower():
+        return _router_exec_open_app({"app_name": "whatsapp"})
+    t_b0 = time.perf_counter()
+    res = action_open_browser(str(url))
+    t_b1 = time.perf_counter()
+    return res, (t_b1 - t_b0)
+
+
+def _router_exec_web_search_play(args: dict) -> tuple[str, float]:
+    query = args.get("query") or args.get("q") or args.get("search") or args.get("url") or ""
+    if not query:
+        raise ValueError("Missing 'query' argument")
+
+    q_str = str(query).strip()
+    q_lower = q_str.lower()
+
+    if "whatsapp" in q_lower:
+        return _router_exec_open_app({"app_name": "whatsapp"})
+
+    # For YouTube, open youtube.com/results?search_query=... directly
+    if "youtube" in q_lower or "yt" in q_lower or q_lower.startswith("play ") or q_lower.startswith("watch "):
+        clean_q = re.sub(r"^(?:open\s+|search\s+(?:for\s+)?|play\s+|watch\s+|on\s+youtube\s*)+", "", q_str, flags=re.I).strip()
+        if not clean_q:
+            clean_q = q_str
+        target_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(clean_q)}"
+    else:
+        target_url = normalize_url(q_str)
+
+    t_b0 = time.perf_counter()
+    res = action_open_browser(target_url)
+    t_b1 = time.perf_counter()
+    return res, (t_b1 - t_b0)
+
+
+def _router_exec_type_text(args: dict) -> tuple[str, float]:
+    text = args.get("text") or args.get("content") or ""
+    if not text:
+        raise ValueError("Missing 'text' argument")
+    return _ctrl_type_anywhere(str(text)), 0.0
+
+
+def _router_exec_click(args: dict) -> tuple[str, float]:
+    text = args.get("text") or args.get("target") or ""
+    if not text:
+        raise ValueError("Missing 'text' argument")
+    return _ctrl_click_text(str(text)), 0.0
+
+
+# Generic tool registry for Single-Pass Router
+GENERIC_ROUTER_TOOLS = {
+    "open_app": _router_exec_open_app,
+    "focus_app": _router_exec_open_app,
+
+    "open_url": _router_exec_open_url,
+    "open_browser": _router_exec_open_url,
+
+    "web_search_play": _router_exec_web_search_play,
+    "web_search": _router_exec_web_search_play,
+
+    "type_text": _router_exec_type_text,
+    "type_anywhere": _router_exec_type_text,
+
+    "click": _router_exec_click,
+    "click_text": _router_exec_click,
+}
+
+
+def try_single_pass_router(command: str) -> tuple[bool, str, dict]:
+    """
+    Attempts single-pass router execution with qwen2.5:3b model.
+    Tracks perf_counter timing for model call, tool execution, and browser launch.
+    """
+    t_start = time.perf_counter()
+    timings = {"model_time": 0.0, "tool_time": 0.0, "browser_time": 0.0, "total_time": 0.0}
+
+    payload = {
+        "model": ROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+            {"role": "user", "content": command}
+        ],
+        "stream": False,
+        "format": "json",
+        "keep_alive": -1,
+        "options": {
+            "temperature": 0,
+            "num_predict": 60,
+            "num_ctx": 2048
+        }
+    }
+
+    t_model_start = time.perf_counter()
+    try:
+        resp = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=15)
+        t_model_end = time.perf_counter()
+        timings["model_time"] = t_model_end - t_model_start
+
+        if resp.status_code != 200:
+            print(f"  [Router] Ollama HTTP status {resp.status_code}")
+            timings["total_time"] = time.perf_counter() - t_start
+            return False, f"HTTP {resp.status_code}", timings
+
+        raw_reply = resp.json().get("message", {}).get("content", "").strip()
+        print(f"  [Router Single-Pass] Model output: {raw_reply}")
+
+        parsed = json.loads(raw_reply)
+        tool_name = parsed.get("tool", "").strip()
+        args = parsed.get("args") or parsed.get("params") or {}
+
+        if not tool_name or tool_name not in GENERIC_ROUTER_TOOLS:
+            print(f"  [Router] Unknown or invalid tool '{tool_name}' returned.")
+            timings["total_time"] = time.perf_counter() - t_start
+            return False, f"Unknown tool '{tool_name}'", timings
+
+    except Exception as exc:
+        t_model_end = time.perf_counter()
+        timings["model_time"] = t_model_end - t_model_start
+        timings["total_time"] = time.perf_counter() - t_start
+        print(f"  [Router] Model call or JSON parse error: {exc}")
+        return False, str(exc), timings
+
+    t_tool_start = time.perf_counter()
+    try:
+        executor = GENERIC_ROUTER_TOOLS[tool_name]
+        result_text, browser_time = executor(args)
+        t_tool_end = time.perf_counter()
+
+        timings["tool_time"] = t_tool_end - t_tool_start
+        timings["browser_time"] = browser_time
+        timings["total_time"] = time.perf_counter() - t_start
+
+        # If it's a multi-action desktop app command (e.g. "send message in whatsapp"),
+        # launch the app first and continue multi-step agent loop for remaining steps.
+        cmd_lower = command.lower()
+        if tool_name in ("open_app", "focus_app") and any(action in cmd_lower for action in ["send", "msg", "message", "type", "write", "save"]):
+            print(f"  [Router Single-Pass] App focused ({args}). Handing off to multi-step agent loop for complete progression...")
+            return False, result_text, timings
+
+        return True, result_text, timings
+    except Exception as exc:
+        t_tool_end = time.perf_counter()
+        timings["tool_time"] = t_tool_end - t_tool_start
+        timings["total_time"] = time.perf_counter() - t_start
+        print(f"  [Router] Tool execution error: {exc}")
+        return False, f"Tool execution failed: {exc}", timings
+
+
+def print_timing_summary(timings: dict):
+    m_t = timings.get("model_time", 0.0)
+    t_t = timings.get("tool_time", 0.0)
+    b_t = timings.get("browser_time", 0.0)
+    tot = timings.get("total_time", 0.0)
+    if b_t > 0:
+        print(f"  [Timing] Model call: {m_t:.3f}s | Tool execution: {t_t:.3f}s (Browser launch: {b_t:.3f}s) | Total: {tot:.3f}s")
+    else:
+        print(f"  [Timing] Model call: {m_t:.3f}s | Tool execution: {t_t:.3f}s | Total: {tot:.3f}s")
+
+
 def agent_loop(goal: str, max_steps: int = MAX_STEPS) -> str:
     """
-    Fully agentic OBSERVE → REASON → ACT loop.
-    Every user goal enters the LLM reasoning loop.
-    No hardcoded intent fast-paths. No extra verification LLM calls.
-    The LLM inspects the desktop state and chooses tools step by step.
+    Fully agentic OBSERVE → REASON → ACT loop with Single-Pass Router.
     """
+    # ── 1. Single-Pass Router Execution ──────────────────────────────────
+    success, result_text, timings = try_single_pass_router(goal)
+    if success:
+        print(f"  Result: {result_text}")
+        print_timing_summary(timings)
+        print(f"\n{'='*64}\n  [DONE] {result_text}\n{'='*64}\n")
+        return result_text
+
+    print("  [Router Fallback] Single-pass router could not route command. Falling back to multi-step agent loop...\n")
+
     print("\n" + "=" * 64)
     print("  TaskForge — Fully Agentic Computer-Use Loop")
     print(f"  Goal: {goal}")
@@ -1070,7 +1288,7 @@ def agent_loop(goal: str, max_steps: int = MAX_STEPS) -> str:
         # Auto-advance progression for desktop app actions (e.g. WhatsApp, Notepad)
         focus_done = any(h.get("tool") == "focus_app" for h in history)
         
-        if tool_name == "focus_app" and focus_done:
+        if focus_done:
             goal_lower = goal.lower()
             if "notepad" in goal_lower:
                 m_text = re.search(r"\btype\s+(.*?)(?:\s+and|\s+save|$)", goal, re.I)
